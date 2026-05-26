@@ -215,6 +215,14 @@ ELASTICSEARCH_RECAP_ALERTS_NUMBER_OF_REPLICAS = env(
     "ELASTICSEARCH_RECAP_ALERTS_NUMBER_OF_REPLICAS", default=0
 )
 
+# Opinions Alerts Percolator index shards and replicas
+ELASTICSEARCH_OPINIONS_ALERTS_NUMBER_OF_SHARDS = env(
+    "ELASTICSEARCH_OPINIONS_ALERTS_NUMBER_OF_SHARDS", default=1
+)
+ELASTICSEARCH_OPINIONS_ALERTS_NUMBER_OF_REPLICAS = env(
+    "ELASTICSEARCH_OPINIONS_ALERTS_NUMBER_OF_REPLICAS", default=0
+)
+
 
 # ES Auto refresh. In production, it's suggested to wait for ES periodically
 # refresh (every ~1 second) since it's a resource-intensive operation.
@@ -239,6 +247,14 @@ SCHEDULED_ALERT_HITS_LIMIT = 20
 PERCOLATOR_RECAP_SEARCH_ALERTS_ENABLED = env(
     "PERCOLATOR_RECAP_SEARCH_ALERTS_ENABLED", default=False
 )
+
+PERCOLATOR_OPINIONS_SEARCH_ALERTS_ENABLED = env(
+    "PERCOLATOR_OPINIONS_SEARCH_ALERTS_ENABLED", default=False
+)
+
+# The maximum number of attorneys in parties data allowed for percolating a
+# docket after merging parties.
+MAX_ATTORNEYS_TO_PERCOLATE = env("MAX_ATTORNEYS_TO_PERCOLATE", default=50)
 
 ################################
 # ES bulk indexing batch size #
@@ -294,4 +310,10 @@ ELASTICSEARCH_CARDINALITY_PRECISION = 2000
 
 ELASTICSEARCH_MICRO_CACHE_ENABLED = env(
     "ELASTICSEARCH_MICRO_CACHE_ENABLED", default=False
+)
+ELASTICSEARCH_API_MICRO_CACHE_ENABLED = env(
+    "ELASTICSEARCH_API_MICRO_CACHE_ENABLED", default=False
+)
+ELASTICSEARCH_FEED_MICRO_CACHE_ENABLED = env(
+    "ELASTICSEARCH_FEED_MICRO_CACHE_ENABLED", default=False
 )

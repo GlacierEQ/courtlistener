@@ -36,18 +36,6 @@ def unmatched_citation_is_valid(
         )
         return False
 
-    if not groups.get("volume").isdigit():
-        logger.error(
-            "Unexpected non-integer volume value in FullCaseCitation %s",
-            citation,
-        )
-        return False
-
-    # This would raise a DataError, we have seen cases from bad OCR or
-    # citation lookalikes. See #5191
-    if int(groups["volume"]) >= 32_767:
-        return False
-
     # avoid storing self citations as unmatched; the self citation will
     # usually be found at the beginning of the opinion's text
     # Note that both Citation.__str__ and UnmatchedCitation.__str__ use
@@ -128,7 +116,9 @@ def store_unmatched_citations(
         unmatched_citations_to_store.append(citation_object)
 
     if unmatched_citations_to_store:
-        UnmatchedCitation.objects.bulk_create(unmatched_citations_to_store)
+        UnmatchedCitation.objects.bulk_create(
+            unmatched_citations_to_store, ignore_conflicts=True
+        )
 
 
 def handle_unmatched_citations(

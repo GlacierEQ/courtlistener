@@ -210,6 +210,87 @@ class PodcastTest(ESIndexTestCase, TestCase):
         )
         self.assertTrue(pubdate_not_present)
 
+    def test_search_podcast_has_individualized_metadata(self) -> None:
+        """Does the search podcast include query-specific title and
+        description?"""
+        params = {
+            "q": "magnitsky",
+            "type": SEARCH_TYPES.ORAL_ARGUMENT,
+        }
+        response = self.client.get(
+            reverse("search_podcast", args=["search"]),
+            params,
+        )
+        self.assertEqual(200, response.status_code)
+        xml_tree = etree.fromstring(response.content)
+
+        # Title should contain the query and CourtListener branding
+        title = xml_tree.xpath("//channel/title")[0].text  # type: ignore
+        self.assertIn("magnitsky", title)
+        self.assertIn("CourtListener", title)
+
+        # Description should contain the query
+        description = xml_tree.xpath("//channel/description")[0].text  # type: ignore
+        self.assertIn("magnitsky", description)
+
+        # iTunes subtitle should also contain the query
+        subtitle = xml_tree.xpath(
+            "//channel/itunes:subtitle",
+            namespaces={
+                "itunes": "https://www.itunes.com/dtds/podcast-1.0.dtd",
+            },
+        )[0].text  # type: ignore
+        self.assertIn("magnitsky", subtitle)
+
+    def test_podcast_excludes_audios_without_processed_mp3(self) -> None:
+        """Audios indexed before `process_audio_file` finishes (or whose
+        `local_path` ends up None at index time) must not appear in the feed —
+        otherwise the enclosure URL renders as `.../None`.
+        """
+        with (
+            mock.patch(
+                "cl.lib.es_signal_processor.allow_es_audio_indexing",
+                side_effect=lambda x, y: True,
+            ),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            unprocessed = AudioWithParentsFactory.create(
+                docket=DocketFactory(
+                    court=self.court_1,
+                    date_argued=datetime.date(2018, 1, 1),
+                ),
+                duration=0,
+            )
+        self.addCleanup(unprocessed.delete)
+        self.assertFalse(
+            bool(unprocessed.local_path_mp3),
+            msg="Test setup should produce an Audio without a processed MP3.",
+        )
+
+        response = self.client.get(
+            reverse(
+                "jurisdiction_podcast",
+                kwargs={"court": self.court_1.id},
+            )
+        )
+        self.assertEqual(200, response.status_code)
+        xml_tree = etree.fromstring(response.content)
+
+        items = xml_tree.findall(".//channel/item")
+        self.assertEqual(
+            len(items),
+            2,
+            msg="Unprocessed audio leaked into the feed.",
+        )
+
+        for enclosure in xml_tree.findall(".//channel/item/enclosure"):
+            url = enclosure.get("url", "")
+            self.assertNotIn(
+                "None",
+                url,
+                msg=f"Feed emitted a broken enclosure URL: {url}",
+            )
+
     def test_catch_es_errors(self) -> None:
         """Can we catch es errors and just render an empy podcast?"""
 
@@ -474,9 +555,13 @@ class TranscriptionTest(TestCase):
         """Is Audio object updated and AudioTranscriptMetadata created correctly?"""
         audio = self.audio_1
 
-        with mock.patch(
-            "openai.resources.audio.transcriptions.Transcriptions.create"
-        ) as patched_transcription:
+        with (
+            mock.patch(
+                "openai.resources.audio.transcriptions.Transcriptions.create"
+            ) as patched_transcription,
+            mock.patch("cl.lib.celery_utils.get_task_wait") as patched_wait,
+        ):
+            patched_wait.return_value = 0
             patched_transcription.return_value = (
                 self.OpenAITranscriptionClass()
             )
@@ -527,9 +612,12 @@ class TranscriptionTest(TestCase):
         """Is Audio.stt_status updated correctly on failure?"""
         audio = self.audio_1
 
-        with mock.patch(
-            "openai.resources.audio.transcriptions.Transcriptions.create"
-        ) as patched_transcription:
+        with (
+            mock.patch(
+                "openai.resources.audio.transcriptions.Transcriptions.create"
+            ) as patched_transcription,
+            mock.patch("cl.lib.celery_utils.get_task_wait") as patched_wait,
+        ):
             mock_response = MockResponse(422, content="")
             setattr(mock_response, "request", {})
             setattr(mock_response, "headers", {"x-request-id": "1"})
@@ -540,6 +628,7 @@ class TranscriptionTest(TestCase):
                     body="",
                 )
             )
+            patched_wait.return_value = 0
             transcribe_from_open_ai_api(audio_pk=audio.pk)
 
         audio.refresh_from_db()

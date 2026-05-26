@@ -5,12 +5,16 @@ from unittest.mock import MagicMock, patch
 from asgiref.sync import sync_to_async
 from django.core import mail
 from django.core.cache import cache
+from django.http import HttpResponse
+from django.test import override_settings
 from django.urls import reverse
 from lxml.html import fromstring
+from waffle.testutils import override_flag
 
 from cl.audio.factories import AudioWithParentsFactory
 from cl.lib.test_helpers import SimpleUserDataMixin
-from cl.tests.cases import TestCase
+from cl.simple_pages.forms import ContactForm
+from cl.tests.cases import SimpleTestCase, TestCase
 
 
 # Mock the hcaptcha thing so that we're sure it validates during tests
@@ -23,6 +27,7 @@ class ContactTest(SimpleUserDataMixin, TestCase):
         "message": "123456789012345678901",
         "email": "pandora@box.com",
         "hcaptcha": "xxx",
+        "checked_documentation": True,
     }
 
     async def test_multiple_requests_request(self, mock: MagicMock) -> None:
@@ -128,11 +133,45 @@ class ContactTest(SimpleUserDataMixin, TestCase):
         self.assertEqual(response.status_code, HTTPStatus.FOUND)
         self.assertEqual(len(mail.outbox), 1)
 
+    async def test_documentation_checkbox_required(
+        self, mock: MagicMock
+    ) -> None:
+        """Is the documentation checkbox required for support-type issues?"""
+        for issue_type in ContactForm.DOCUMENTATION_CHECK_TYPES:
+            with self.subTest(issue_type=issue_type):
+                msg = self.test_msg.copy()
+                msg["issue_type"] = issue_type
+                if issue_type in ContactForm.TECH_ISSUE_TYPES:
+                    msg["tech_description"] = "Something is broken"
+                del msg["checked_documentation"]
 
-class SimplePagesTest(SimpleUserDataMixin, TestCase):
+                # Without checkbox, form is rejected
+                response = await self.async_client.post(
+                    reverse("contact"), msg
+                )
+                self.assertEqual(response.status_code, HTTPStatus.OK)
+
+                # With checkbox, form is accepted
+                msg["checked_documentation"] = True
+                response = await self.async_client.post(
+                    reverse("contact"), msg
+                )
+                self.assertEqual(response.status_code, HTTPStatus.FOUND)
+
+    async def test_documentation_checkbox_not_required_for_other_types(
+        self, mock: MagicMock
+    ) -> None:
+        """Is the documentation checkbox skipped for non-support issue types?"""
+        msg = self.test_msg.copy()
+        msg["issue_type"] = "data_quality"
+        msg.pop("checked_documentation", None)
+        response = await self.async_client.post(reverse("contact"), msg)
+        self.assertEqual(response.status_code, HTTPStatus.FOUND)
+
+
+class PageLoadTestMixin(TestCase):
     def assert_page_title_in_html(self, content: str) -> None:
         """Make sure a page has a valid HTML title"""
-        print("Checking for HTML title tag....", end="")
         html_tree = fromstring(content)
         title = cast(list[str], html_tree.xpath("//title/text()"))
         self.assertGreater(
@@ -145,17 +184,15 @@ class SimplePagesTest(SimpleUserDataMixin, TestCase):
             0,
             msg="The text in this title tag is empty.",
         )
-        print("✓")
 
-    async def assert_page_loads_ok(self, reverse_param: dict) -> None:
+    async def assert_page_loads_ok(self, reverse_param: dict) -> HttpResponse:
         """Does a page load properly?
 
         :param reverse_param: Params that can be sent to Django's reverse
         function to get a URL path.
-        :return: None
+        :return: The response object.
         """
         path = reverse(**reverse_param)
-        print(f"Testing basic load of: {path}...", end="")
         r = await self.async_client.get(path)
         self.assertEqual(
             r.status_code,
@@ -168,11 +205,13 @@ class SimplePagesTest(SimpleUserDataMixin, TestCase):
                 code=r.status_code,
             ),
         )
-        print("✓")
         is_html = "text/html" in r["content-type"]
         if r["content-type"] and is_html:
-            self.assert_page_title_in_html(r.content)
+            self.assert_page_title_in_html(r.content.decode())
+        return r
 
+
+class SimplePagesTest(PageLoadTestMixin, SimpleUserDataMixin, TestCase):
     async def test_simple_pages(self) -> None:
         """Do all the simple pages load properly?"""
         reverse_params: list[dict[str, Any]] = [
@@ -184,8 +223,6 @@ class SimplePagesTest(SimpleUserDataMixin, TestCase):
             # Info pages
             {"viewname": "faq"},
             {"viewname": "feeds_info"},
-            {"viewname": "contribute"},
-            {"viewname": "replication_docs"},
             {"viewname": "terms"},
             {"viewname": "robots"},
             # Contact
@@ -199,25 +236,11 @@ class SimplePagesTest(SimpleUserDataMixin, TestCase):
             {"viewname": "advanced_search"},
             {"viewname": "recap_email_help"},
             {"viewname": "broken_email_help"},
-            # API help pages
-            {"viewname": "case_law_api_help"},
-            {"viewname": "citation_api_help"},
-            {"viewname": "pacer_api_help"},
-            {"viewname": "recap_api_help"},
-            {"viewname": "judge_api_help"},
-            {"viewname": "field_api_help"},
-            {"viewname": "oral_argument_api_help"},
-            {"viewname": "visualization_api_help"},
-            {"viewname": "webhooks_docs"},
-            {"viewname": "webhooks_getting_started"},
-            {"viewname": "citation_lookup_api"},
-            {"viewname": "alert_api_help"},
-            {"viewname": "financial_disclosures_api_help"},
-            {"viewname": "search_api_help"},
-            {"viewname": "rest_change_log"},
+            {"viewname": "citegeist_help"},
             {"viewname": "old_terms", "args": ["1"]},
             {"viewname": "old_terms", "args": ["2"]},
             # Monitoring pages
+            {"viewname": "celery_queue_lengths"},
             {"viewname": "heartbeat"},
             {"viewname": "health_check"},
             {"viewname": "check_redis_writes"},
@@ -242,8 +265,6 @@ class SimplePagesTest(SimpleUserDataMixin, TestCase):
             {"viewname": "profile_notes"},
             {"viewname": "profile_search_alerts"},
             {"viewname": "profile_docket_alerts"},
-            {"viewname": "view_visualizations"},
-            {"viewname": "view_deleted_visualizations"},
             {"viewname": "password_change"},
             {"viewname": "delete_account"},
             {"viewname": "take_out"},
@@ -262,3 +283,226 @@ class SimplePagesTest(SimpleUserDataMixin, TestCase):
         self.assertIn(
             "with 4 minutes of recordings (and counting).", r.content.decode()
         )
+
+
+@override_flag("use_new_design", True)
+@override_settings(WAFFLE_CACHE_PREFIX="test_v2_register_waffle")
+class V2PagesRegisterTest(PageLoadTestMixin, SimpleUserDataMixin, TestCase):
+    """Registry of pages with v2 (redesigned) templates.
+
+    Adding a page here is part of the definition of done for a
+    redesigned template. The homepage is excluded — it has dedicated
+    tests in cl/search/tests/test_v2_pages.py.
+    """
+
+    V2_PAGES: list[tuple[dict[str, Any], str]] = [
+        # Help pages — (reverse_param, expected v2 template)
+        ({"viewname": "help_home"}, "v2_help/index.html"),
+        ({"viewname": "coverage"}, "v2_help/coverage.html"),
+        ({"viewname": "coverage_fds"}, "v2_help/coverage_fds.html"),
+        ({"viewname": "coverage_oa"}, "v2_help/coverage_oa.html"),
+        ({"viewname": "coverage_recap"}, "v2_help/coverage_recap.html"),
+        ({"viewname": "alert_help"}, "v2_help/alert_help.html"),
+        ({"viewname": "tag_notes_help"}, "v2_help/tags_help.html"),
+        ({"viewname": "recap_email_help"}, "v2_help/recap_email_help.html"),
+        ({"viewname": "markdown_help"}, "v2_help/markdown_help.html"),
+        # Info pages
+        ({"viewname": "terms"}, "v2_terms/latest.html"),
+        ({"viewname": "citegeist_help"}, "v2_citegeist.html"),
+        ({"viewname": "components"}, "v2_components.html"),
+    ]
+
+    async def test_v2_pages(self) -> None:
+        """Do all registered v2 pages load properly with the redesign flag?"""
+        for reverse_param, v2_template in self.V2_PAGES:
+            with self.subTest(
+                "Checking v2 page", reverse_params=reverse_param
+            ):
+                r = await self.assert_page_loads_ok(reverse_param)
+                self.assertTemplateUsed(r, v2_template)
+
+
+@patch("hcaptcha.fields.hCaptchaField.validate", return_value=True)
+class SealingOrderDetectionTest(SimpleTestCase):
+    def _make_form(
+        self,
+        subject: str = "Test subject",
+        message: str = "http://example.com",
+        issue_type: str = ContactForm.REMOVAL_REQUEST,
+        email: str = "test@example.com",
+    ) -> ContactForm:
+        data: dict[str, Any] = {
+            "name": "Test User",
+            "email": email,
+            "phone_number": subject,
+            "issue_type": issue_type,
+            "message": message,
+            "hcaptcha": "xxx",
+        }
+        if issue_type in ContactForm.DOCUMENTATION_CHECK_TYPES:
+            data["checked_documentation"] = True
+        form = ContactForm(data)
+        form.is_valid()
+        return form
+
+    def test_sealing_keywords_trigger_recategorization(
+        self, mock_captcha: MagicMock
+    ) -> None:
+        keywords = [
+            "urgent",
+            "sealing",
+            "sealed",
+            "redacted",
+            "pseudonym",
+            "anonymity",
+            "press coverage",
+            "time sensitive",
+        ]
+        for keyword in keywords:
+            with self.subTest(keyword=keyword):
+                form = self._make_form(
+                    message=f"Please this is {keyword} http://example.com",
+                )
+                self.assertEqual(form.get_zoho_request_type(), "Sealing Order")
+                self.assertEqual(form.get_zoho_assignee_id(), "")
+
+    def test_removal_without_keywords_stays_removal(
+        self, mock_captcha: MagicMock
+    ) -> None:
+        form = self._make_form(
+            subject="Remove my case",
+            message="Please remove http://example.com/case/123",
+        )
+        self.assertEqual(form.get_zoho_request_type(), "Case Removal Request")
+
+    def test_sealing_keyword_in_subject(self, mock_captcha: MagicMock) -> None:
+        form = self._make_form(
+            subject="Urgent sealing order needed",
+            message="Please see http://example.com/case/123",
+        )
+        self.assertEqual(form.get_zoho_request_type(), "Sealing Order")
+        self.assertEqual(form.get_zoho_assignee_id(), "")
+
+    def test_uscourts_gov_email_treated_as_sealing(
+        self, mock_captcha: MagicMock
+    ) -> None:
+        form = self._make_form(
+            email="clerk@uscourts.gov",
+            issue_type=ContactForm.SUPPORT_REQUEST,
+            message="General question",
+        )
+        self.assertEqual(form.get_zoho_request_type(), "Sealing Order")
+        self.assertEqual(form.get_zoho_assignee_id(), "")
+
+    def test_usdoj_gov_email_treated_as_sealing(
+        self, mock_captcha: MagicMock
+    ) -> None:
+        form = self._make_form(
+            email="attorney@usdoj.gov",
+            issue_type=ContactForm.DATA_QUALITY,
+            message="Data issue",
+        )
+        self.assertEqual(form.get_zoho_request_type(), "Sealing Order")
+        self.assertEqual(form.get_zoho_assignee_id(), "")
+
+    def test_non_gov_email_not_treated_as_sealing(
+        self, mock_captcha: MagicMock
+    ) -> None:
+        form = self._make_form(
+            email="user@gmail.com",
+            issue_type=ContactForm.SUPPORT_REQUEST,
+            message="General question",
+        )
+        self.assertEqual(form.get_zoho_request_type(), "General Support")
+
+
+@override_flag("zoho-desk-tickets", True)
+@override_settings(WAFFLE_CACHE_PREFIX="test_zoho_routing")
+@patch("hcaptcha.fields.hCaptchaField.validate", return_value=True)
+class ZohoRoutingTest(SimpleUserDataMixin, TestCase):
+    """Test that form submissions route to the correct Zoho service."""
+
+    @patch("cl.simple_pages.views.create_zoho_desk_ticket")
+    async def test_support_request_creates_desk_ticket(
+        self, mock_task: MagicMock, mock_captcha: MagicMock
+    ) -> None:
+        msg = {
+            "name": "Test User",
+            "phone_number": "Help needed",
+            "issue_type": "support",
+            "message": "I need general help please",
+            "email": "test@example.com",
+            "hcaptcha": "xxx",
+            "checked_documentation": True,
+        }
+        response = await self.async_client.post(reverse("contact"), msg)
+        self.assertEqual(response.status_code, HTTPStatus.FOUND)
+        mock_task.delay.assert_called_once()
+        call_kwargs = mock_task.delay.call_args.kwargs
+        self.assertEqual(call_kwargs["request_type"], "General Support")
+
+    @patch("cl.simple_pages.views.create_zoho_desk_ticket")
+    async def test_partnership_creates_desk_ticket(
+        self, mock_task: MagicMock, mock_captcha: MagicMock
+    ) -> None:
+        msg = {
+            "name": "Partner Person",
+            "phone_number": "Partnership request",
+            "issue_type": "partnerships",
+            "email": "partner@example.com",
+            "message": "",
+            "partner_background": ["founder"],
+            "partner_current_work": "Building legal tech",
+            "partner_prior_outreach": "Talked to some orgs",
+            "partner_team_size": "2_5",
+            "partner_founded_year": "2024",
+            "partner_funding_total": "none",
+            "partner_funding_stage": "pre_seed",
+            "partner_ideal_outcome": "API access",
+            "hcaptcha": "xxx",
+        }
+        response = await self.async_client.post(reverse("contact"), msg)
+        self.assertEqual(response.status_code, HTTPStatus.FOUND)
+        mock_task.delay.assert_called_once()
+        call_kwargs = mock_task.delay.call_args.kwargs
+        self.assertEqual(call_kwargs["email"], "partner@example.com")
+        self.assertEqual(call_kwargs["request_type"], "Partnership Inquiry")
+
+    @patch("cl.simple_pages.views.create_zoho_desk_ticket")
+    async def test_removal_with_sealing_keyword_is_recategorized(
+        self, mock_task: MagicMock, mock_captcha: MagicMock
+    ) -> None:
+        msg = {
+            "name": "Test User",
+            "phone_number": "Please seal my case",
+            "issue_type": "removal",
+            "message": "Urgent sealing order http://example.com/case",
+            "email": "test@example.com",
+            "hcaptcha": "xxx",
+        }
+        response = await self.async_client.post(reverse("contact"), msg)
+        self.assertEqual(response.status_code, HTTPStatus.FOUND)
+        mock_task.delay.assert_called_once()
+        call_kwargs = mock_task.delay.call_args.kwargs
+        self.assertEqual(call_kwargs["request_type"], "Sealing Order")
+        self.assertEqual(call_kwargs["assignee_id"], "")
+
+    @patch("cl.simple_pages.views.create_zoho_desk_ticket")
+    async def test_uscourts_email_routed_as_sealing(
+        self, mock_task: MagicMock, mock_captcha: MagicMock
+    ) -> None:
+        msg = {
+            "name": "Court Clerk",
+            "phone_number": "General inquiry",
+            "issue_type": "support",
+            "message": "I have a question about a case",
+            "email": "clerk@uscourts.gov",
+            "hcaptcha": "xxx",
+            "checked_documentation": True,
+        }
+        response = await self.async_client.post(reverse("contact"), msg)
+        self.assertEqual(response.status_code, HTTPStatus.FOUND)
+        mock_task.delay.assert_called_once()
+        call_kwargs = mock_task.delay.call_args.kwargs
+        self.assertEqual(call_kwargs["request_type"], "Sealing Order")
+        self.assertEqual(call_kwargs["assignee_id"], "")

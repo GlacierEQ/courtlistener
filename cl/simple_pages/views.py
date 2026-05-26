@@ -24,6 +24,7 @@ from django.template import loader
 from django.template.response import TemplateResponse
 from django.urls import reverse
 from django.utils.timezone import now
+from waffle import flag_is_active
 
 from cl.audio.models import Audio
 from cl.disclosures.models import (
@@ -40,15 +41,17 @@ from cl.disclosures.models import (
 from cl.favorites.models import Prayer
 from cl.favorites.utils import get_lifetime_prayer_stats
 from cl.people_db.models import Person
+from cl.search.cluster_sources import ClusterSources
 from cl.search.models import (
-    SOURCES,
     Court,
     Docket,
     OpinionCluster,
     RECAPDocument,
 )
+from cl.search.selectors import get_available_documents_estimate_count
 from cl.simple_pages.coverage_utils import fetch_data, fetch_federal_data
 from cl.simple_pages.forms import ContactForm
+from cl.simple_pages.tasks import create_zoho_desk_ticket
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +70,9 @@ async def faq(request: HttpRequest) -> HttpResponse:
             "scraped_court_count": await Court.objects.filter(
                 in_use=True, has_opinion_scraper=True
             ).acount(),
+            "total_recap_count": await sync_to_async(
+                get_available_documents_estimate_count
+            )(),
             "total_oa_minutes": (
                 (await Audio.objects.aaggregate(Sum("duration")))[
                     "duration__sum"
@@ -139,6 +145,7 @@ async def alert_help(request: HttpRequest) -> HttpResponse:
         "rt_alerts_sending_rate": int(
             settings.REAL_TIME_ALERTS_SENDING_RATE / 60
         ),
+        "MAX_ATTORNEYS_TO_PERCOLATE": settings.MAX_ATTORNEYS_TO_PERCOLATE,
     }
     context.update(data)
     return TemplateResponse(request, "help/alert_help.html", context)
@@ -263,11 +270,11 @@ async def get_coverage_data_o(request: HttpRequest) -> dict[str, Any]:
         count_lawbox = 0
         count_scraper = 0
         async for d in counts:
-            if SOURCES.PUBLIC_RESOURCE in d["source"]:
+            if ClusterSources.PUBLIC_RESOURCE in d["source"]:
                 count_pro += d["source__count"]
-            if SOURCES.COURT_WEBSITE in d["source"]:
+            if ClusterSources.COURT_WEBSITE in d["source"]:
                 count_scraper += d["source__count"]
-            if SOURCES.LAWBOX in d["source"]:
+            if ClusterSources.LAWBOX in d["source"]:
                 count_lawbox += d["source__count"]
 
         opinion_courts = Court.objects.filter(
@@ -341,7 +348,7 @@ async def coverage_opinions(request: HttpRequest) -> HttpResponse:
                 "state": await fetch_data(Court.STATE_JURISDICTIONS),
                 "territory": await fetch_data(Court.TERRITORY_JURISDICTIONS),
                 "international": await fetch_data(
-                    Court.INTERNATIONAL, group_by_state=False
+                    [Court.INTERNATIONAL], group_by_state=False
                 ),
                 "tribal": await fetch_data(
                     Court.TRIBAL_JURISDICTIONS, group_by_state=False
@@ -397,10 +404,6 @@ async def podcasts(request: HttpRequest) -> HttpResponse:
     )
 
 
-async def contribute(request: HttpRequest) -> HttpResponse:
-    return TemplateResponse(request, "contribute.html", {"private": False})
-
-
 async def contact(
     request: HttpRequest,
     template_path: str = "contact_form.html",
@@ -429,25 +432,37 @@ async def contact(
                 logger.info("Detected spam message. Not sending email.")
                 return HttpResponseRedirect(reverse("contact_thanks"))
 
-            issue_type_label = form.get_issue_type_display()
-
-            default_from = settings.DEFAULT_FROM_EMAIL
-            message = EmailMessage(
-                subject="[CourtListener] Contact: {phone_number}".format(**cd),
-                body="Subject: {phone_number}\n"
-                "From: {name}\n"
-                "User Email: <{email}>\n"
-                "Issue Type: {issue_type_label}\n\n"
-                "{message}\n\n"
-                "Browser: {browser}".format(
-                    browser=request.META.get("HTTP_USER_AGENT", "Unknown"),
-                    issue_type_label=issue_type_label,
-                    **cd,
-                ),
-                to=["support@freelawproject.atlassian.net"],
-                reply_to=[cd.get("email", default_from) or default_from],
+            use_zoho = await sync_to_async(flag_is_active)(
+                request, "zoho-desk-tickets"
             )
-            await sync_to_async(message.send)()
+            if use_zoho:
+                create_zoho_desk_ticket.delay(
+                    subject=cd["phone_number"],
+                    name=cd["name"],
+                    email=cd["email"],
+                    description=form.render_email_body(
+                        user_agent=request.headers.get(
+                            "user-agent", "Unknown"
+                        ),
+                        target="zoho_desk",
+                    ),
+                    request_type=form.get_zoho_request_type(),
+                    assignee_id=form.get_zoho_assignee_id(),
+                )
+            else:
+                default_from = settings.DEFAULT_FROM_EMAIL
+                subject = form.email_subject()
+                body = form.render_email_body(
+                    user_agent=request.headers.get("user-agent", "Unknown")
+                )
+
+                message = EmailMessage(
+                    subject=subject,
+                    body=body,
+                    to=["support@freelawproject.atlassian.net"],
+                    reply_to=[cd.get("email", default_from) or default_from],
+                )
+                await sync_to_async(message.send)()
             return HttpResponseRedirect(reverse("contact_thanks"))
     else:
         # the form is loading for the first time
@@ -483,6 +498,10 @@ async def advanced_search(request: HttpRequest) -> HttpResponse:
     )
 
 
+async def citegeist_help(request: HttpRequest) -> HttpResponse:
+    return TemplateResponse(request, "citegeist.html", {"private": False})
+
+
 async def old_terms(request: HttpRequest, v: str) -> HttpResponse:
     return TemplateResponse(
         request,
@@ -512,7 +531,46 @@ async def validate_for_wot(request: HttpRequest) -> HttpResponse:
 
 
 async def components(request: HttpRequest) -> HttpResponse:
-    return TemplateResponse(request, "components.html", {"private": True})
+    # Mock page object for component library demos
+    class MockPaginator:
+        num_pages = 10
+
+    class MockPageObj:
+        number = 3
+        has_previous = True
+        has_next = True
+        has_other_pages = True
+        paginator = MockPaginator()
+
+        def previous_page_number(self) -> int:
+            return self.number - 1
+
+        def next_page_number(self) -> int:
+            return self.number + 1
+
+    class MockFieldValue:
+        value = None
+
+    class MockDocketFilterForm:
+        errors: dict[str, list[str]] = {}
+        filed_after = MockFieldValue()
+        filed_before = MockFieldValue()
+        entry_gte = MockFieldValue()
+        entry_lte = MockFieldValue()
+
+    class MockDocket:
+        pk = 12345
+
+    return TemplateResponse(
+        request,
+        "components.html",
+        {
+            "private": True,
+            "demo_page_obj": MockPageObj(),
+            "demo_docket": MockDocket(),
+            "demo_filter_form": MockDocketFilterForm(),
+        },
+    )
 
 
 async def ratelimited(
